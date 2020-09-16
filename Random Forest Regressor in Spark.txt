@@ -1,0 +1,189 @@
+                                                             RANDOM FOREST REGRESSOR IN SPARK
+
+
+
+-- From the terminal start spark shell
+
+spark-shell
+
+-- Creating the database
+sqlContext.sql("create database vz")
+
+-- Create table using the command below to store data in hive tables.
+
+sqlContext.sql("CREATE TABLE m_d(day string,hr int,enodeb int,eutrancell string,carrier_x string,sip_sc_abnormal_releases double,sip_sc_call_answers double,sip_sc_call_attempts double,sip_sc_call_completions double,sip_sc_call_drops double,sip_sc_call_drops_including_handover double,sip_sc_call_setup_completes double,sip_sc_call_setup_failures double,adjusted_sip_sc_dcs double,adjusted_sip_sc_dc_pct double,handover_attempts double,handoverfailures double,handover_failure_pct double,qci1_bd_pct_num double,qci1_bd_pct_den double,key_ramesh string,centerline_type int,lat_new double,long_new double,key_frequency string,dc_perc double,loc_id int,enode_b int,summary string,icon string,precipIntensity double,precipProbability double,temperature double,apparentTemperature double,dewPoint double,humidity double,pressure double,windSpeed double,windGust double,windBearing double,cloudCover double,uvIndex double,visibility double,ozone double,precipType string,action int) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TextFile");
+
+-- Using the database created
+sqlContext.sql("use vz");
+
+-- Pushing data from csv to hive table we created.
+sqlContext.sql("LOAD DATA LOCAL INPATH '/home/cloudera/Desktop/test_vz_data.csv' OVERWRITE INTO TABLE m_d")
+
+-- To check if the data is pushed correctly.
+sqlContext.sql("Select * from m_d").show()
+
+--------------------------------------------------------- MODEL WITH WEATHER, HEIGHT AND FREQUENCY ONLY----------------------------------------------------
+
+
+sqlContext.sql("use vz");
+
+val merged_data= sqlContext.sql("SELECT * FROM m_d")
+merged_data.count
+
+/* Dropping NULL values from the data */
+val merged_data_out=merged_data.na.drop()
+merged_data_out.count
+
+/* Dropping values from the data where absolute value of Handover Failure % is greater than 100% */
+val merged_data=merged_data_out.where(col("handover_failure_pct")<=math.abs(100))
+merged_data.count
+
+/* Dropping values from the data where absolute value of adjusted_sip_sc_dc_perc is greater than 100 */
+val merged_data=merged_data_out.where(col("adjusted_sip_sc_dc_pct")<=math.abs(100))
+merged_data_out.count
+
+/* Dropping values from the data where absolute value of adjusted_sip_sc_dc_perc is greater than 100 */
+val merged_data_out=merged_data.where(col("adjusted_sip_sc_dc_pct")<=math.abs(100))
+merged_data_out.count
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+import org.apache.spark.ml.feature.StringIndexer
+import org.apache.spark.ml.feature.OneHotEncoder;
+val freq_indexer = new StringIndexer().setInputCol("key_frequency").setOutputCol("freq_ind").fit(merged_data_out).transform(merged_data_out)
+val freq_encoder = new OneHotEncoder().setInputCol("freq_ind").setOutputCol("freq_enc")
+val merged_data_fin = freq_encoder.transform(freq_indexer) 
+merged_data_fin.show(false)
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+
+import org.apache.spark.ml.feature.StringIndexer
+val indexer = new StringIndexer().setInputCol("key_frequency").setOutputCol("freq_enc").fit(merged_data_out)
+val merged_data_fin = indexer.transform(merged_data_out)
+
+
+import org.apache.spark.ml.feature.StringIndexer
+val indexer = new StringIndexer().setInputCol("key_ramesh").setOutputCol("enode_enc").fit(merged_data_fin)
+val merged_data_out = indexer.transform(merged_data_fin)
+
+val merged_data_fin= merged_data_out
+
+merged_data_fin.persist()
+
+merged_data_fin.printSchema()
+
+/* Creating a dataframe to store the mapping of actual radio number and the encoded radio number. */
+-- This can be used in the future to predict values against the actual radio number as the model uses the encoded radio number. 
+-- So, there has to be a way to retrieve the actual radio number and this method ensures that it is not lost.
+val enode_num_df=merged_data_fin.select("key_ramesh","enode_enc").distinct
+
+val freq_num_df=merged_data_fin.select("key_frequency","freq_enc").distinct
+
+val data_actual_dc_perc=merged_data_fin.select("enode_enc","freq_enc","hr","cloudcover","precipintensity","temperature","uvindex", "windspeed", "pressure", "humidity","centerline_type", "handover_failure_pct")
+
+data_actual_dc_perc.printSchema()
+
+data_actual_dc_perc.show(false)
+
+/* Creating LabeledPointRDD for applying models. */
+--Mapping each row to entities of corresponding datatype to create a vector values.
+--Feature Vector is a vector having all the columns excpet the last one - the dependent variable.
+--Label is a vector which contains the last column in the data - the dependent variable.
+--The LabeledPointRDD dc_perc_rdd is formed by mapping the dataframe data_actual_dc_perc to the schema (label,featureVector) after the above transformation.
+import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.regression._
+val dc_perc_rdd=data_actual_dc_perc.rdd.map(row => {val values = Array(row.getAs[Double](0),row.getAs[Double](1),row.getAs[Int](2),row.getAs[Double](3),row.getAs[Double](4),row.getAs[Double](5),row.getAs[Int](6),row.getAs[Double](7),row.getAs[Double](8),row.getAs[Double](9),row.getAs[Int](10),row.getAs[Double](11))
+    val featureVector = Vectors.dense(values.init)
+    val label = values.last
+LabeledPoint(label,featureVector)})
+
+dc_perc_rdd.take(10)
+
+val Array(trainData, testData) = dc_perc_rdd.randomSplit(Array(0.7, 0.3),100)
+
+/*Using Random Forest */
+--model_dc_perc is a Random Forest Model that trained on the training set using the specified configurations of the model.
+--Number of trees, Impurity, Max Depth and Max number of bins.
+import org.apache.spark.mllib.tree.RandomForest
+import org.apache.spark.mllib.tree.model.RandomForestModel
+import org.apache.spark.mllib.util.MLUtils
+val categoricalFeaturesInfo = Map[Int, Int]()
+val numTrees = 8
+val featureSubsetStrategy = "auto" 
+val impurity = "variance"
+val maxDepth = 4
+val maxBins = 100
+val model_dc_perc = RandomForest.trainRegressor(trainData,categoricalFeaturesInfo,numTrees, featureSubsetStrategy, impurity, maxDepth, maxBins)
+
+
+-- labelsAndPredictions is a RDD that is formed by applying the model on the test data.
+--label is the actual value of the dependent variable in the test data.
+--prediction is the predicted value of the dependent variable obtained by applying the model on the testdata.
+val labelsAndPredictions = testData.map { point =>
+  val prediction = model_dc_perc.predict(point.features)
+  (point.label, prediction)
+}
+
+--Sample records in labelsAndPredictions
+labelsAndPredictions.take(10)
+
+--Combined set of all the features,the label and the predicted value.
+val featuresLabelsAndPredictions = testData.map { point =>
+  val prediction = model_dc_perc.predict(point.features)
+  (point.features,point.label, prediction)
+}
+
+--Sample records in featuresLabelsAndPredictions
+featuresLabelsAndPredictions.take(10)
+
+--Converting featuresLabelsAndPredictions to a dataframe.
+import sqlContext.implicits._
+val df_test_dc_perc=featuresLabelsAndPredictions.toDF()
+
+--An UDF is created to split a vector into individual fields.
+import org.apache.spark.sql.functions.udf
+def columnExtractor(idx: Int) = udf((v: Vector) => v(idx))
+
+--Applying the UDF on df_test_dc_perc. Now,df_test_dc_perc_pred contains the predicted data splitted correctly into columns.
+val df_test_dc_perc_pred=df_test_dc_perc.withColumn("enode_enc",columnExtractor(0)($"_1")).withColumn("freq_enc",columnExtractor(1)($"_1")).withColumn("hr",columnExtractor(2)($"_1")).withColumn("cloudcover",columnExtractor(3)($"_1")).withColumn("precipintensity",columnExtractor(4)($"_1")).withColumn("temperature",columnExtractor(5)($"_1")).withColumn("uvindex",columnExtractor(6)($"_1")).withColumn("windspeed",columnExtractor(7)($"_1")).withColumn("pressure",columnExtractor(8)($"_1")).withColumn("humidity",columnExtractor(9)($"_1")).withColumn("centerline_type",columnExtractor(10)($"_1")).withColumn("actual_dc_perc",$"_2").withColumn("predicted_dc_perc",$"_3").select("enode_enc","freq_enc","hr","cloudcover","precipintensity","temperature","uvindex","windspeed","pressure","humidity","centerline_type","actual_dc_perc","predicted_dc_perc")
+
+df_test_dc_perc_pred.show(10)
+
+-- Joining with the radionumber dataframe previously created to get the actual value of the radio number.
+val df_test_dc_perc_pred_fin=df_test_dc_perc_pred.join(enode_num_df,Seq("enode_enc"),"inner")
+
+-- Joining with the radionumber dataframe previously created to get the actual value of the radio number.
+val df_test_dc_perc_pred=df_test_dc_perc_pred_fin.join(freq_num_df,Seq("freq_enc"),"inner")
+
+val df_test_dc_perc_pred_fin=df_test_dc_perc_pred
+
+
+--Saving the entire actual and predicted test  dataset into a Hive table for future analysis.
+df_test_dc_perc_pred_fin.write.mode("overwrite").format("parquet").saveAsTable("vz_freq_height")
+
+
+
+/* Computing metrics */
+import org.apache.spark.mllib.evaluation.RegressionMetrics
+val metrics_dc_perc = new RegressionMetrics(labelsAndPredictions)
+--Squared error
+println(s"MSE = ${metrics_dc_perc.meanSquaredError}")
+
+
+println(s"RMSE = ${metrics_dc_perc.rootMeanSquaredError}")
+
+--Mean absolute error
+println(s"MAE = ${metrics_dc_perc.meanAbsoluteError}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
